@@ -1,3 +1,5 @@
+
+
 # 一、索引
 
 # 二、事务
@@ -277,15 +279,41 @@ readview是事务进行快照读操作的时候生成的读视图，在该事务
 >
 > 1、记录undo log 缓冲池和持久化
 >
-> 2、记录redo log缓冲池，按对应持久化策略持久化
+> 2、记录redo log缓冲池，按对应持久化策略持久化 prepare状态
 >
-> 3、事务提交
+> 3、事务提交 binlog持久化、redolog  commit状态
 >
 > 4、按策略刷新redo log到磁盘数据页中记录checkpoint 位置
 >
 > 如果数据库宕机，
 >
-> 恢复数据根据checkpoint记录的同步位置，使用redo log重做恢复数据。重做日志是日志可能是提交的事务也可能是未提交的事务，分析redo log中是否有事务提交记录，已提交直接重做恢复，未提交先重做然后根据undo log回滚。
+> 恢复数据根据checkpoint记录的同步位置，使用redo log重做恢复数据。重做日志是日志可能是提交的事务也可能是未提交的事务，分析redo log中事务状态，已提交直接重做恢复，未提交判断binlog是否完整，完整直接重做，不完整先重做然后根据undo log回滚。
+
+### 4、redolog、 binlog 两阶段提交
+
+ https://mp.weixin.qq.com/s/QLnbpRNKd9TqPHDSsioKwg
+
+> 1. 将语句执行
+> 2. 记录redo log，并将记录状态设置为prepare
+> 3. 通知Server，已经修改好了，可以提交事务了
+> 4. 将更新的内容写入binlog
+> 5. commit，提交事务
+> 6. 将redo log里这个事务相关的记录状态设置为commited
+>
+> **prepare：** redolog写入log buffer，并fsync持久化到磁盘，在redolog事务中记录2PC的XID，在redolog事务打上prepare标识
+>
+> **commit：** binlog写入log buffer，并fsync持久化到磁盘，在binlog事务中记录2PC的XID，同时在redolog事务打上commit标识 其中，prepare和commit阶段所提到的“事务”，都是指内部XA事务，即2PC
+
+恢复步骤
+
+> redolog中的事务如果经历了二阶段提交中的prepare阶段，则会打上prepare标识，如果经历commit阶段，则会打上commit标识（此时redolog和binlog均已落盘）。
+>
+> 1. 按顺序扫描redolog，如果redolog中的事务既有prepare标识，又有commit标识，就直接提交（复制redolog disk中的数据页到磁盘数据页）
+>
+> 2. 如果redolog事务只有prepare标识，没有commit标识，则说明当前事务在commit阶段crash了，binlog中当前事务是否完整未可知，此时拿着redolog中当前事务的XID（redolog和binlog中事务落盘的标识），去查看binlog中是否存在此XID
+>
+> 3. 1. 如果binlog中有当前事务的XID，则提交事务（复制redolog disk中的数据页到磁盘数据页）
+>    2. 如果binlog中没有当前事务的XID，则回滚事务（使用undolog来删除redolog中的对应事务）
 
 # 三、锁
 
@@ -297,9 +325,13 @@ readview是事务进行快照读操作的时候生成的读视图，在该事务
 
 允许事务读数据，也可简单称为读锁。
 
+加锁方式：select…lock in share mode
+
 #### （2）排它锁（X LOCK）
 
 允许事务删除或更新数据，也可称为写锁。
+
+加锁方式：select…for update 、**update、insert、delete** 当前读
 
 #### （3）兼容性
 
@@ -345,15 +377,23 @@ readview是事务进行快照读操作的时候生成的读视图，在该事务
 
 innodb中行锁是基于索引加载的，行锁需要加载命中的索引上，索引范围写操作或没有用到索引会升级成表锁。
 
+加锁时机：索引命中
+
 #### （2）表锁
 
 对表加锁，没有使用索引，或者索引锁定的数据过多会使用表锁。表被锁定期间其他事务不能对该表进行写操作，容易发生锁冲突堵塞，但是不容易发生死锁。
+
+表级锁可以分为：表锁、元数据锁、意向锁三种。
+
+加锁时机：**一般情况是对应的存储引擎没有行级锁（例如：MyIASM），或者是对应的 SQL 语句没有匹配到索引。**
 
 ### 4、间隙锁、临键锁
 
 #### （1）间隙锁
 
 **间隙锁是封锁索引记录中的间隔**，或者第一条索引记录之前的范围，又或者最后一条索引记录之后的范围。
+
+间隙锁的引入是为了解决在RR隔离级别的幻读问题。但是大部分读都是快照读，通过mvcc解决，可重复读的情况下也不会出现幻读。
 
 **产生间隙锁的条件（RR事务隔离级别下）：**
 
@@ -712,3 +752,71 @@ show variables like "general_log%";
 
 ![image-20210917104226205](./mysql学习笔记.assets/image-20210917104226205.png)
 
+
+
+## 索引失效场景
+
+> - 左前缀匹配：联合索引左前匹配
+> - like 不能以%开头
+> - 少用or条件
+> - 索引上使用函数或者列计算
+> - 字段类型是字符串，查询使用的数字，类型不一致
+> - 查询条件数据量大，需要回表查询速度慢 优化成不适用索引
+> - not in、not exist、is null、!=
+> - 关联查询，关联字段类型编码格式不一样
+
+## 执行计划详解
+
+在sql优化的时候，我们经常会使用explain sql语句 查看执行计划，来分析sql的执行情况是否有使用到索引
+
+执行之后返回的字段如下：
+
+![image-20210924134602087](mysql.assets/image-20210924134602087.png)
+
+| 字段名        | 字段说明                                                     |
+| ------------- | ------------------------------------------------------------ |
+| select_type   | 查询类型<br />simple-简单查询<br />primary-最外层查询<br />subquery-映射为子查询<br />derived-子查询<br />union-联合<br />union result-使用联合的结果 |
+| table         | 使用的表                                                     |
+| partitions    | 分区                                                         |
+| type          | 访问类型<br />性能：`all` < `index` < `range` < `index_merge` < `ref_or_null` < `ref` < `eq_ref` < `system/const`<br/>性能在 range 之下基本都可以进行调优 |
+| possible_keys | 可能使用的索引                                               |
+| key           | 使用的索引                                                   |
+| key_len       | 索引长度                                                     |
+| ref           |                                                              |
+| rows          | 扫描的行数                                                   |
+| filtered      | 读取的行数和扫描行数比例，越大效率越高                       |
+| Extra         | 重要的额外信息                                               |
+
+select_type字段详解
+
+| select_type  |      说明      |
+| :----------: | :------------: |
+|    SIMPLE    |    简单查询    |
+|   PRIMARY    |   最外层查询   |
+|   SUBQUERY   |  映射为子查询  |
+|   DERIVED    |     子查询     |
+|    UNION     |      联合      |
+| UNION RESULT | 使用联合的结果 |
+
+type字段说明
+
+|    type     |                             说明                             |
+| :---------: | :----------------------------------------------------------: |
+|     ALL     |                           全表扫描                           |
+|    index    |                          索引树扫描                          |
+|    RANGE    |                     对索引列进行范围查找                     |
+| INDEX_MERGE |                合并索引，使用多个单列索引搜索                |
+|     REF     |     非主键非唯一索引等值扫描 ，根据索引查找一个或多个值      |
+|   EQ_REF    |             搜索时使用primary key 或 unique类型              |
+|    CONST    | 常量，表最多有一个匹配行,因为仅有一行,在这行的列值可被优化器剩余部分认为是常数,const表很快,因为它们只读取一次。 |
+|   SYSTEM    |   系统，表仅有一行(=系统表)。这是const联接类型的一个特例。   |
+
+extra详解
+
+- **Using filesort**：MySQL 对数据使用一个外部的文件内容进行了排序，而不是按照表内的索引进行排序读取。
+- **Using temporary**：使用临时表保存中间结果，也就是说 MySQL 在对查询结果排序时使用了临时表，常见于order by 或 group by。
+- **Using index**：表示 SQL 操作中使用了覆盖索引（Covering Index），避免了访问表的数据行，效率高。
+- **Using index condition**：表示 SQL 操作命中了索引，但不是所有的列数据都在索引树上，还需要访问实际的行记录。
+- **Using where**：表示 SQL 操作使用了 where 过滤条件。
+- **Select tables optimized away**：基于索引优化 MIN/MAX 操作或者 MyISAM 存储引擎优化 COUNT(*) 操作，不必等到执行阶段再进行计算，查询执行计划生成的阶段即可完成优化。
+- **Using join buffer (Block Nested Loop)**：表示 SQL 操作使用了关联查询或者子查询，且需要进行嵌套循环计算。
